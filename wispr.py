@@ -427,7 +427,7 @@ DOUBLE_TAP_MS = 0.40
 
 def on_press(key):
     global _ctrl_held, _last_release, _ai_mode
-    if key != pynput_kb.Key.ctrl_r or _ctrl_held:
+    if key != pynput_kb.Key.alt or _ctrl_held:
         return
     _ctrl_held = True
     now = time.time()
@@ -447,7 +447,7 @@ def on_release(key):
     if key == pynput_kb.Key.esc:
         QApplication.quit()
         return False
-    if key != pynput_kb.Key.ctrl_r or not _ctrl_held:
+    if key != pynput_kb.Key.alt or not _ctrl_held:
         return
     _ctrl_held = False
     _last_release = time.time()
