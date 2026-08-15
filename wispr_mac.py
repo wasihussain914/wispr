@@ -378,34 +378,36 @@ class PillOverlay(QWidget):
         self._drag_pos = None
 
 # ── hotkey ────────────────────────────────────────────────────────────────────
-_ctrl_held    = False
+# Hold Right Option (⌥) to record. Double-tap to toggle AI mode.
+HOTKEY      = pynput_kb.Key.alt_r   # Right Option on Mac
+_held       = False
 _last_release = 0.0
-_ai_mode      = False
-DOUBLE_TAP    = 0.40
+_ai_mode    = False
+DOUBLE_TAP  = 0.40
 
 def on_press(key):
-    global _ctrl_held, _last_release, _ai_mode
-    if key != pynput_kb.Key.ctrl_r or _ctrl_held:
+    global _held, _last_release, _ai_mode
+    if key != HOTKEY or _held:
         return
-    _ctrl_held = True
+    _held = True
     now = time.time()
     if now - _last_release < DOUBLE_TAP:
         _ai_mode = not _ai_mode
         sig.ai_toggle.emit(_ai_mode)
         print(f"AI mode {'ON ✨' if _ai_mode else 'OFF'}", flush=True)
-        _ctrl_held = False
+        _held = False
         return
     play_start()
     sig.start_rec.emit(_ai_mode)
     threading.Thread(target=start_recording, daemon=True).start()
 
 def on_release(key):
-    global _ctrl_held, _last_release
+    global _held, _last_release
     if key == pynput_kb.Key.esc:
         QApplication.quit(); return False
-    if key != pynput_kb.Key.ctrl_r or not _ctrl_held:
+    if key != HOTKEY or not _held:
         return
-    _ctrl_held = False
+    _held = False
     _last_release = time.time()
     if not _recording:
         return
@@ -430,5 +432,5 @@ overlay = PillOverlay()
 listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
 listener.daemon = True
 listener.start()
-print("Ready. Hold Right Ctrl to dictate. Double-tap to toggle AI. Esc to quit.", flush=True)
+print("Ready. Hold Right Option (⌥) to dictate. Double-tap to toggle AI. Esc to quit.", flush=True)
 sys.exit(app.exec_())
