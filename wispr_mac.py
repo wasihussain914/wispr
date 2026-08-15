@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 Wispr clone — macOS version.
-Hold Right Ctrl to record, release to transcribe + paste.
-Double-tap Right Ctrl to toggle AI polish mode (Haiku).
+Hold Right Option (⌥) to record, release to transcribe + paste.
+Double-tap Right Option to toggle AI polish mode (Haiku).
+
+Uses CGEventTap via pyobjc for hotkeys — compatible with macOS Tahoe (26.x)
+where pynput crashes due to TSMGetInputSourceProperty threading assertion.
 """
 import subprocess, tempfile, threading, time, sys, os, math, struct, wave, io
 import numpy as np
@@ -12,7 +15,11 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QPainter, QColor, QFont
 
 import sounddevice as sd
-from pynput import keyboard as pynput_kb
+import Quartz
+from CoreFoundation import (
+    CFMachPortCreateRunLoopSource, CFRunLoopAddSource,
+    CFRunLoopGetCurrent, CFRunLoopRun, kCFRunLoopDefaultMode,
+)
 import mlx_whisper
 
 # ── model ───────────────────────────────────────────────────────────────────
@@ -228,16 +235,24 @@ def _clipboard_set(data):
     except Exception:
         pass
 
+def _send_cmd_v():
+    """Synthesize Cmd+V via CGEventPost (no pynput needed)."""
+    V_KEYCODE = 9
+    down = Quartz.CGEventCreateKeyboardEvent(None, V_KEYCODE, True)
+    Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+    up = Quartz.CGEventCreateKeyboardEvent(None, V_KEYCODE, False)
+    Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
 def _paste(text):
     try:
         saved = _clipboard_get()
         subprocess.run(["pbcopy"], input=text.encode(), timeout=2)
-        time.sleep(0.08)
-        kb = pynput_kb.Controller()
-        with kb.pressed(pynput_kb.Key.cmd):
-            kb.press("v"); kb.release("v")
+        time.sleep(0.10)
+        _send_cmd_v()
         time.sleep(0.15)
-        _clipboard_set(saved)   # restore original clipboard
+        _clipboard_set(saved)
     except Exception as e:
         print(f"paste error: {e}", flush=True)
 
@@ -377,60 +392,89 @@ class PillOverlay(QWidget):
     def mouseReleaseEvent(self, e):
         self._drag_pos = None
 
-# ── hotkey ────────────────────────────────────────────────────────────────────
-# Hold Right Option (⌥) to record. Double-tap to toggle AI mode.
-HOTKEY      = pynput_kb.Key.alt_r   # Right Option on Mac
-_held       = False
+# ── hotkey via CGEventTap (no pynput — safe on macOS Tahoe) ──────────────────
+# Right Option keycode = 61, Esc = 53
+RIGHT_OPT  = 61
+ESC_KEY    = 53
+FLAG_ALT   = Quartz.kCGEventFlagMaskAlternate  # set when either Option is held
+
+_held         = False
 _last_release = 0.0
-_ai_mode    = False
-DOUBLE_TAP  = 0.40
+_ai_mode      = False
+DOUBLE_TAP    = 0.40
 
-def on_press(key):
+
+def _on_key_event(proxy, event_type, event, refcon):
     global _held, _last_release, _ai_mode
-    if key != HOTKEY or _held:
-        return
-    _held = True
-    now = time.time()
-    if now - _last_release < DOUBLE_TAP:
-        _ai_mode = not _ai_mode
-        sig.ai_toggle.emit(_ai_mode)
-        print(f"AI mode {'ON ✨' if _ai_mode else 'OFF'}", flush=True)
-        _held = False
-        return
-    play_start()
-    sig.start_rec.emit(_ai_mode)
-    threading.Thread(target=start_recording, daemon=True).start()
+    keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
 
-def on_release(key):
-    global _held, _last_release
-    if key == pynput_kb.Key.esc:
-        QApplication.quit(); return False
-    if key != HOTKEY or not _held:
+    if event_type == Quartz.kCGEventFlagsChanged and keycode == RIGHT_OPT:
+        flags   = Quartz.CGEventGetFlags(event)
+        pressed = bool(flags & FLAG_ALT)
+        if pressed and not _held:
+            _held = True
+            now = time.time()
+            if now - _last_release < DOUBLE_TAP:
+                _ai_mode = not _ai_mode
+                sig.ai_toggle.emit(_ai_mode)
+                print(f"AI mode {'ON ✨' if _ai_mode else 'OFF'}", flush=True)
+                _held = False
+            else:
+                play_start()
+                sig.start_rec.emit(_ai_mode)
+                threading.Thread(target=start_recording, daemon=True).start()
+        elif not pressed and _held:
+            _held = False
+            _last_release = time.time()
+            if _recording:
+                sig.stop_rec.emit()
+                ai = _ai_mode
+                def _work():
+                    path = stop_recording()
+                    text = transcribe_path(path)
+                    if text and ai:
+                        print("Polishing…", flush=True)
+                        text = ai_polish(text)
+                        print(f"Polished: {text}", flush=True)
+                    if text:
+                        _paste(text + " ")
+                    play_done()
+                    sig.done.emit()
+                threading.Thread(target=_work, daemon=True).start()
+
+    elif event_type == Quartz.kCGEventKeyDown and keycode == ESC_KEY:
+        QApplication.quit()
+
+    return event   # pass event through
+
+
+def _start_event_tap():
+    mask = (Quartz.CGEventMaskBit(Quartz.kCGEventFlagsChanged) |
+            Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown))
+    tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap,
+        Quartz.kCGHeadInsertEventTap,
+        Quartz.kCGEventTapOptionDefault,
+        mask,
+        _on_key_event,
+        None,
+    )
+    if not tap:
+        print("ERROR: Could not create event tap.", flush=True)
+        print("Go to System Settings → Privacy & Security → Accessibility → add Terminal.", flush=True)
         return
-    _held = False
-    _last_release = time.time()
-    if not _recording:
-        return
-    sig.stop_rec.emit()
-    ai = _ai_mode
-    def _work():
-        path = stop_recording()
-        text = transcribe_path(path)
-        if text and ai:
-            print("Polishing…", flush=True)
-            text = ai_polish(text)
-            print(f"Polished: {text}", flush=True)
-        if text:
-            _paste(text + " ")
-        play_done()
-        sig.done.emit()
-    threading.Thread(target=_work, daemon=True).start()
+    src = CFMachPortCreateRunLoopSource(None, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode)
+    Quartz.CGEventTapEnable(tap, True)
+    CFRunLoopRun()   # blocks this thread — that's intentional
+
 
 # ── main ──────────────────────────────────────────────────────────────────────
 app = QApplication(sys.argv)
 overlay = PillOverlay()
-listener = pynput_kb.Listener(on_press=on_press, on_release=on_release)
-listener.daemon = True
-listener.start()
+
+tap_thread = threading.Thread(target=_start_event_tap, daemon=True)
+tap_thread.start()
+
 print("Ready. Hold Right Option (⌥) to dictate. Double-tap to toggle AI. Esc to quit.", flush=True)
 sys.exit(app.exec_())
